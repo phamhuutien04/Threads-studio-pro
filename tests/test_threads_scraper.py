@@ -105,6 +105,16 @@ class RootPostTests(unittest.TestCase):
             ["https://cdn.example/first.mp4", "https://cdn.example/second.mp4"],
         )
 
+    def test_only_first_carousel_image_is_collected(self) -> None:
+        from threadstudio.scrapers.threads_scraper import _extract_post_images
+
+        post = make_post("images-1", "ImagePost", AUTHOR, "Image post")
+        post["carousel_media"] = [
+            {"image_versions2": {"candidates": [{"url": "https://cdn.example/first.jpg"}]}},
+            {"image_versions2": {"candidates": [{"url": "https://cdn.example/second.jpg"}]}},
+        ]
+        self.assertEqual(_extract_post_images(post), ["https://cdn.example/first.jpg"])
+
     def test_video_only_post_is_not_discarded(self) -> None:
         post = make_post("video-only", "VideoOnly", AUTHOR, "")
         post["video_versions"] = [{"url": "https://cdn.example/video.mp4"}]

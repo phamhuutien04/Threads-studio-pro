@@ -4,9 +4,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import os
 from pathlib import Path
 import shutil
+import stat
 import threading
+import time
 
 from fluent_blue.compatibility.qt import QObject, QtCore
 
@@ -281,10 +284,7 @@ class BatchPipelineManager(QObject):
                 shutil.move(str(final_mp4), str(destination))
             workspace = Path(job.output_dir)
             if workspace.exists() and workspace.resolve() != output_root.resolve():
-                try:
-                    shutil.rmtree(workspace)
-                except OSError as cleanup_exc:
-                    logger.warning("[Job #%s] Không thể dọn hết dữ liệu tạm: %s", job_id, cleanup_exc)
+                self._remove_workspace_with_retries(workspace, job_id)
             final_mp4 = destination
             job.output_dir = ""
             job.output_mp4 = str(final_mp4)
@@ -314,4 +314,24 @@ class BatchPipelineManager(QObject):
             vieneu_clone_ref_audio=self.settings.vieneu_clone_ref_audio,
             vieneu_clone_ref_text=self.settings.vieneu_clone_ref_text,
         )
+
+    @staticmethod
+    def _remove_workspace_with_retries(workspace: Path, job_id: str) -> None:
+        """Reliably remove Windows job artifacts after FFmpeg releases handles."""
+
+        def _clear_readonly_and_retry(func, path, _exc_info) -> None:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+
+        last_error: OSError | None = None
+        for attempt in range(10):
+            try:
+                shutil.rmtree(workspace, onerror=_clear_readonly_and_retry)
+                return
+            except OSError as exc:
+                last_error = exc
+                if not workspace.exists():
+                    return
+                time.sleep(0.25 + attempt * 0.15)
+        raise OSError(f"Không thể xóa thư mục tạm sau 10 lần thử: {workspace}: {last_error}")
 

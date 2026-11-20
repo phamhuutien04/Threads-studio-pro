@@ -152,7 +152,8 @@ def scrape_threads_url(
         seg_id = "root" if idx == 0 else f"cmt_{idx:02d}"
         avatar_local = _download_asset(item.get("avatar_url", ""), media_cache_dir, f"{seg_id}_avatar")
         img_locals: list[str] = []
-        for img_i, img_url in enumerate(item.get("image_urls", [])[:2]):
+        image_urls = item.get("image_urls", [])[:1]
+        for img_i, img_url in enumerate(image_urls):
             local_p = _download_asset(img_url, media_cache_dir, f"{seg_id}_img_{img_i}")
             if local_p:
                 img_locals.append(local_p)
@@ -173,7 +174,7 @@ def scrape_threads_url(
                 avatar_local=avatar_local,
                 raw_text=item.get("text", "").strip(),
                 spoken_text=item.get("text", "").strip(),
-                image_urls=item.get("image_urls", []),
+                image_urls=image_urls,
                 image_locals=img_locals,
                 video_urls=item.get("video_urls", []),
                 video_locals=video_locals,
@@ -316,7 +317,6 @@ def _find_root_post(posts: list[dict[str, Any]], url: str) -> dict[str, Any] | N
 
 
 def _extract_post_images(p: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
     carousel = p.get("carousel_media") or []
     candidates_containers = carousel if carousel else [p]
     for item in candidates_containers:
@@ -326,8 +326,10 @@ def _extract_post_images(p: dict[str, Any]) -> list[str]:
         img_v2 = (item.get("image_versions2") or {}).get("candidates") or []
         if img_v2 and isinstance(img_v2[0], dict) and img_v2[0].get("url"):
             if not item.get("video_versions"):
-                urls.append(img_v2[0]["url"])
-    return urls
+                # Threads carousels can contain many images; the studio only
+                # uses the first actual image from each post.
+                return [str(img_v2[0]["url"])]
+    return []
 
 
 def _extract_post_videos(p: dict[str, Any]) -> list[str]:
