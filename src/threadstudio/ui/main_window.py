@@ -130,6 +130,25 @@ class _AudioSeekSlider(Slider):
         super().mousePressEvent(event)
 
 
+class _WindowResizeGrip(QWidget):
+    """Invisible native resize handle for one edge or corner."""
+
+    def __init__(self, window: QWidget, edges, cursor) -> None:
+        super().__init__(window)
+        self._target_window = window
+        self._edges = edges
+        self.setCursor(cursor)
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton and not self._target_window.isMaximized():
+            handle = self._target_window.windowHandle()
+            if handle is not None and handle.startSystemResize(self._edges):
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class _AsyncUiBridge(QObject := QtCore.QObject):
     voice_preview_ready = Signal(str)
     voice_preview_failed = Signal(str)
@@ -165,8 +184,11 @@ class ThreadsStudioWindow(FluentWindow):
         self._audio_player.setAudioOutput(self._audio_out)
         self._audio_out.setVolume(0.95)
 
+        # Smallest resizable size that still keeps the video Stage visible.
+        self.setMinimumSize(1100, 700)
         self.resize(1460, 900)
         self._build_shell()
+        self._install_window_resize_grips()
         self._wire_signals()
         self._install_command_palette()
         self._refresh_queue_table()
@@ -253,8 +275,51 @@ class ThreadsStudioWindow(FluentWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
+        if hasattr(self, "_resize_grips"):
+            self._layout_window_resize_grips()
         if hasattr(self, "_center_stage_splitter"):
             self._apply_responsive_layout(event.size().width(), event.size().height())
+
+    def _install_window_resize_grips(self) -> None:
+        self._resize_grips = {
+            "left": _WindowResizeGrip(self, Qt.Edge.LeftEdge, Qt.CursorShape.SizeHorCursor),
+            "right": _WindowResizeGrip(self, Qt.Edge.RightEdge, Qt.CursorShape.SizeHorCursor),
+            "top": _WindowResizeGrip(self, Qt.Edge.TopEdge, Qt.CursorShape.SizeVerCursor),
+            "bottom": _WindowResizeGrip(self, Qt.Edge.BottomEdge, Qt.CursorShape.SizeVerCursor),
+            "top_left": _WindowResizeGrip(
+                self, Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.CursorShape.SizeFDiagCursor
+            ),
+            "top_right": _WindowResizeGrip(
+                self, Qt.Edge.TopEdge | Qt.Edge.RightEdge, Qt.CursorShape.SizeBDiagCursor
+            ),
+            "bottom_left": _WindowResizeGrip(
+                self, Qt.Edge.BottomEdge | Qt.Edge.LeftEdge, Qt.CursorShape.SizeBDiagCursor
+            ),
+            "bottom_right": _WindowResizeGrip(
+                self, Qt.Edge.BottomEdge | Qt.Edge.RightEdge, Qt.CursorShape.SizeFDiagCursor
+            ),
+        }
+        self._layout_window_resize_grips()
+
+    def _layout_window_resize_grips(self) -> None:
+        width, height = self.width(), self.height()
+        edge = 7
+        corner = 14
+        geometries = {
+            "left": (0, corner, edge, max(0, height - corner * 2)),
+            "right": (max(0, width - edge), corner, edge, max(0, height - corner * 2)),
+            "top": (corner, 0, max(0, width - corner * 2), edge),
+            "bottom": (corner, max(0, height - edge), max(0, width - corner * 2), edge),
+            "top_left": (0, 0, corner, corner),
+            "top_right": (max(0, width - corner), 0, corner, corner),
+            "bottom_left": (0, max(0, height - corner), corner, corner),
+            "bottom_right": (max(0, width - corner), max(0, height - corner), corner, corner),
+        }
+        maximized = self.isMaximized()
+        for name, grip in self._resize_grips.items():
+            grip.setVisible(not maximized)
+            grip.setGeometry(*geometries[name])
+            grip.raise_()
 
     def _apply_responsive_layout(self, width: int, height: int) -> None:
         mode = "compact" if width < 1100 else "medium" if width < 1500 else "wide"
