@@ -94,7 +94,10 @@ def compose_final_video(
     # 3. Prepare concatenated muted B-roll stream if `sub_enabled`
     sub_reel_mp4: Path | None = None
     picked_subs: list[str] = []
-    if job.layout.sub_enabled:
+    has_threads_video = any(
+        Path(path).is_file() for segment in job.segments for path in segment.video_locals
+    )
+    if job.layout.sub_enabled and not has_threads_video:
         sub_candidates = list_media_files(job.media.sub_video_dir, VIDEO_EXTS)
         if sub_candidates:
             sub_reel_mp4, picked_subs = _build_sub_video_reel(
@@ -320,11 +323,18 @@ def _run_ffmpeg_compositor(
         sub_idx = next_idx
         next_idx += 1
 
-    card_indices: list[tuple[int, SegmentItem]] = []
+    card_indices: list[tuple[int, int | None, SegmentItem]] = []
     for seg in segments:
         inputs += ["-loop", "1", "-t", f"{total_dur:.3f}", "-i", str(seg.card_png_path)]
-        card_indices.append((next_idx, seg))
+        card_idx = next_idx
         next_idx += 1
+        attached_video = next((Path(path) for path in seg.video_locals if Path(path).is_file()), None)
+        video_idx: int | None = None
+        if attached_video is not None and seg.card_media_w_px > 0 and seg.card_media_h_px > 0:
+            inputs += ["-stream_loop", "-1", "-i", str(attached_video)]
+            video_idx = next_idx
+            next_idx += 1
+        card_indices.append((card_idx, video_idx, seg))
 
     chains: list[str] = [
         f"[0:v]fps=24,scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
@@ -346,10 +356,26 @@ def _run_ffmpeg_compositor(
     card_cx = CANVAS_W * (layout.card_x_pct / 100.0)
     card_cy = CANVAS_H * (layout.card_y_pct / 100.0)
 
-    for c_i, (inp_i, seg) in enumerate(card_indices):
+    for c_i, (inp_i, video_idx, seg) in enumerate(card_indices):
         scaled_lbl = f"card_s_{c_i}"
         out_lbl = f"v_step_{c_i}"
-        chains.append(f"[{inp_i}:v]scale={target_card_w}:-1:flags=lanczos[{scaled_lbl}]")
+        if video_idx is not None:
+            media_w, media_h = seg.card_media_w_px, seg.card_media_h_px
+            card_w, card_h = seg.card_width_px or 920, seg.card_height_px
+            chains.extend(
+                [
+                    f"[{video_idx}:v]fps=24,scale={media_w}:{media_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={media_w}:{media_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=rgba[thread_media_{c_i}]",
+                    f"color=c=black@0.0:s={card_w}x{card_h}:r=24:d={total_dur:.3f},format=rgba[card_base_{c_i}]",
+                    f"[card_base_{c_i}][thread_media_{c_i}]overlay=x={seg.card_media_x_px}:"
+                    f"y={seg.card_media_y_px}:shortest=0:eof_action=repeat[card_media_{c_i}]",
+                    f"[{inp_i}:v]format=rgba[card_png_{c_i}]",
+                    f"[card_media_{c_i}][card_png_{c_i}]overlay=0:0:shortest=0:eof_action=repeat[card_native_{c_i}]",
+                    f"[card_native_{c_i}]scale={target_card_w}:-1:flags=lanczos[{scaled_lbl}]",
+                ]
+            )
+        else:
+            chains.append(f"[{inp_i}:v]scale={target_card_w}:-1:flags=lanczos[{scaled_lbl}]")
         enable_expr = f"between(t,{seg.start_sec:.3f},{seg.end_sec:.3f})"
         chains.append(
             f"[{curr_v}][{scaled_lbl}]overlay="

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from threadstudio.core.models import CommentMode
 from threadstudio.scrapers.threads_scraper import (
     _collect_post_objects,
+    _extract_post_videos,
     _find_root_post,
     _select_comments,
     scrape_threads_url,
@@ -92,6 +93,24 @@ class RootPostTests(unittest.TestCase):
         others_only = _select_comments(root, replies, comment_mode=CommentMode.TOP_LIKES_NO_AUTHOR.value, max_comments=6)
         self.assertEqual([post["text"] for post in author_only], ["Author reply"])
         self.assertEqual([post["username"] for post in others_only], ["nguyen5026tan"])
+
+    def test_video_versions_are_collected_from_post_and_carousel(self) -> None:
+        post = make_post("video-1", "VideoPost", AUTHOR, "Video post")
+        post["carousel_media"] = [
+            {"video_versions": [{"url": "https://cdn.example/first.mp4"}]},
+            {"video_versions": [{"url": "https://cdn.example/second.mp4"}]},
+        ]
+        self.assertEqual(
+            _extract_post_videos(post),
+            ["https://cdn.example/first.mp4", "https://cdn.example/second.mp4"],
+        )
+
+    def test_video_only_post_is_not_discarded(self) -> None:
+        post = make_post("video-only", "VideoOnly", AUTHOR, "")
+        post["video_versions"] = [{"url": "https://cdn.example/video.mp4"}]
+        posts = _collect_post_objects([{"post": post}])
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["video_urls"], ["https://cdn.example/video.mp4"])
 
     def scrape_with_payloads(self, payloads: list, dom_posts: list | None = None) -> tuple:
         playwright = MagicMock()

@@ -49,6 +49,7 @@ from fluent_blue.compatibility.qt import (
     QDesktopServices,
     QHBoxLayout,
     QMediaPlayer,
+    QSizePolicy,
     QStackedWidget,
     Qt,
     QtCore,
@@ -101,6 +102,9 @@ class ThreadsStudioWindow(FluentWindow):
         self._current_inspect_job_id: str | None = None
         self._syncing_layout_controls = False
         self._syncing_segment_editor = False
+        self._responsive_mode = ""
+        self._log_is_compact = False
+        self._sidebar_auto_collapsed = False
 
         # Audio preview player
         self._audio_player = QMediaPlayer(self)
@@ -124,6 +128,10 @@ class ThreadsStudioWindow(FluentWindow):
 
     def _build_shell(self) -> None:
         root = QWidget()
+        root.setMinimumSize(0, 0)
+        root.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._content_host.setMinimumSize(0, 0)
+        self._content_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         root_col = QVBoxLayout(root)
         pad = ThemeManager.spacing(2)
         root_col.setContentsMargins(pad, pad, pad, pad)
@@ -136,8 +144,9 @@ class ThreadsStudioWindow(FluentWindow):
         self._body_log_splitter = Splitter(orientation="vertical", collapsible=True)
 
         # Horizontal 3-Zone Workspace: Sidebar | Center Pages | Right 9:16 Stage
-        workspace_holder = QWidget()
-        ws_row = QHBoxLayout(workspace_holder)
+        self._workspace_holder = QWidget()
+        self._workspace_holder.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        ws_row = QHBoxLayout(self._workspace_holder)
         ws_row.setContentsMargins(0, 0, 0, 0)
         ws_row.setSpacing(ThemeManager.spacing(2))
 
@@ -152,6 +161,8 @@ class ThreadsStudioWindow(FluentWindow):
         ws_row.addWidget(self._sidebar)
 
         self._pages = QStackedWidget()
+        self._pages.setMinimumSize(0, 0)
+        self._pages.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._page_keys = ["queue", "inspector", "voices", "media", "settings"]
         self._pages.addWidget(self._build_queue_page())
         self._pages.addWidget(self._build_inspector_page())
@@ -159,8 +170,14 @@ class ThreadsStudioWindow(FluentWindow):
         self._pages.addWidget(self._build_media_page())
         self._pages.addWidget(self._build_settings_page())
 
+        self._stage_panel = self._build_right_stage_panel()
+        self._stage_panel.setMinimumSize(0, 0)
+        self._stage_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self._stage_scroll = ScrollArea(self._stage_panel)
+        self._stage_scroll.setMinimumSize(0, 0)
+        self._stage_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._center_stage_splitter = Splitter(
-            widgets=[self._pages, self._build_right_stage_panel()],
+            widgets=[self._pages, self._stage_scroll],
             orientation="horizontal",
             sizes=[850, 390],
             collapsible=False,
@@ -168,16 +185,69 @@ class ThreadsStudioWindow(FluentWindow):
         ws_row.addWidget(self._center_stage_splitter, 1)
 
         # Bottom Multi-Threaded Log Panel
-        log_panel = self._build_log_panel()
-        self._body_log_splitter.addWidget(workspace_holder)
-        self._body_log_splitter.addWidget(log_panel)
+        self._log_panel = self._build_log_panel()
+        self._body_log_splitter.addWidget(self._workspace_holder)
+        self._body_log_splitter.addWidget(self._log_panel)
         self._body_log_splitter.setSizes([665, 195])
 
         root_col.addWidget(self._body_log_splitter, 1)
         self.set_central_widget(root)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if hasattr(self, "_center_stage_splitter"):
+            self._apply_responsive_layout(event.size().width(), event.size().height())
+
+    def _apply_responsive_layout(self, width: int, height: int) -> None:
+        mode = "compact" if width < 1100 else "medium" if width < 1500 else "wide"
+        if mode != self._responsive_mode:
+            self._responsive_mode = mode
+            if mode in ("compact", "medium"):
+                if not self._sidebar.is_collapsed():
+                    self._sidebar.set_collapsed(True)
+                    self._sidebar_auto_collapsed = True
+                self._title_lbl.hide()
+                self._encoder_badge.hide()
+                self._btn_cmd_palette.hide()
+                self._switch_dark.hide()
+            if mode == "compact":
+                self._canvas.setMinimumSize(180, 220)
+                self._center_stage_splitter.setOrientation(Qt.Orientation.Vertical)
+                available = max(500, self._center_stage_splitter.height())
+                self._pages.setMaximumHeight(max(190, int(available * 0.38)))
+                self._center_stage_splitter.setSizes([int(available * 0.38), int(available * 0.62)])
+            elif mode == "medium":
+                self._pages.setMaximumHeight(16777215)
+                self._canvas.setMinimumSize(220, 360)
+                self._center_stage_splitter.setOrientation(Qt.Orientation.Horizontal)
+                available = max(800, self._center_stage_splitter.width())
+                self._center_stage_splitter.setSizes([int(available * 0.55), int(available * 0.45)])
+            else:
+                self._pages.setMaximumHeight(16777215)
+                if self._sidebar_auto_collapsed:
+                    self._sidebar.set_collapsed(False)
+                    self._sidebar_auto_collapsed = False
+                self._title_lbl.show()
+                self._encoder_badge.show()
+                self._btn_cmd_palette.show()
+                self._switch_dark.show()
+                self._canvas.setMinimumSize(250, 410)
+                self._center_stage_splitter.setOrientation(Qt.Orientation.Horizontal)
+                available = max(900, self._center_stage_splitter.width())
+                self._center_stage_splitter.setSizes([int(available * 0.60), int(available * 0.40)])
+
+        short = height < 780
+        if short and not self._log_is_compact:
+            self._log_is_compact = True
+            self._body_log_splitter.setSizes([max(500, height - 70), 0])
+        elif not short and self._log_is_compact:
+            self._log_is_compact = False
+            self._body_log_splitter.setSizes([max(500, height - 210), 180])
+
     def _build_top_bar(self) -> QWidget:
         bar = QWidget()
+        bar.setMinimumSize(0, 0)
+        bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout(bar)
         row.setContentsMargins(ThemeManager.spacing(1), 0, ThemeManager.spacing(1), 0)
         row.setSpacing(ThemeManager.spacing(2))
@@ -185,8 +255,8 @@ class ThreadsStudioWindow(FluentWindow):
         self._btn_collapse_nav = IconButton(icon="sidebar", tooltip="Thu gọn / mở rộng thanh điều hướng")
         row.addWidget(self._btn_collapse_nav)
 
-        title_lbl = Text("Threads Studio Pro", style="heading-4")
-        row.addWidget(title_lbl)
+        self._title_lbl = Text("Threads Studio Pro", style="heading-4")
+        row.addWidget(self._title_lbl)
 
         has_gpu = nvenc_available() and self.settings.prefer_nvenc
         self._encoder_badge = Badge(
@@ -204,7 +274,7 @@ class ThreadsStudioWindow(FluentWindow):
             placeholder="Chọn Preset chủ đề…",
             size="small",
         )
-        self._preset_select.setMinimumWidth(250)
+        self._preset_select.setMinimumWidth(160)
         row.addWidget(self._preset_select)
 
         self._btn_apply_preset = Button("Nạp Preset", size="small", variant="secondary", icon="wand")
@@ -575,10 +645,11 @@ class ThreadsStudioWindow(FluentWindow):
         col.setContentsMargins(0, 0, ThemeManager.spacing(2), 0)
         col.setSpacing(ThemeManager.spacing(3))
 
-        btn_save_preset = Button("Lưu Thành Preset Mới", size="small", variant="primary", icon="save")
+        btn_save_preset = Button("Lưu Preset Mới", size="small", variant="primary", icon="save")
+        self._btn_delete_preset = Button("Xóa Preset", size="small", variant="danger", icon="trash")
         folders_panel = Panel(
-            title="Nguồn Video & Âm Thanh (Tự Chọn Ngẫu Nhiên & Tự Lặp Đủ Thời Lượng)",
-            actions=[btn_save_preset],
+            title="Nguồn Video & Âm Thanh",
+            actions=[self._btn_delete_preset, btn_save_preset],
             padding=4,
         )
 
@@ -642,6 +713,7 @@ class ThreadsStudioWindow(FluentWindow):
         col.addStretch(1)
 
         btn_save_preset.clicked.connect(self._save_current_as_preset)
+        self._btn_delete_preset.clicked.connect(self._delete_selected_preset)
         scroll.setWidget(container)
         return scroll
 
@@ -1424,6 +1496,19 @@ class ThreadsStudioWindow(FluentWindow):
         self._preset_select.set_value(len(opts) - 1)
         self._new_preset_name.clear_text()
         Toast.show(f"Đã lưu Preset '{name}'!", parent=self, variant="success")
+
+    def _delete_selected_preset(self) -> None:
+        idx = self._preset_select.value()
+        if idx is None or not (0 <= int(idx) < len(self.settings.presets)):
+            Toast.show("Chưa có Preset nào được chọn để xóa.", parent=self, variant="info")
+            return
+        removed = self.settings.presets.pop(int(idx))
+        self.settings.save()
+        options = [(preset.name, i) for i, preset in enumerate(self.settings.presets)]
+        self._preset_select.set_options(options)
+        if options:
+            self._preset_select.set_value(min(int(idx), len(options) - 1))
+        Toast.show(f"Đã xóa Preset '{removed.name}'.", parent=self, variant="success")
 
     def _start_threads_login(self) -> None:
         profile_dir = self.settings.user_data_dir() / "threads_profile"

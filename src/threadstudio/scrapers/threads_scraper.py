@@ -156,6 +156,13 @@ def scrape_threads_url(
             local_p = _download_asset(img_url, media_cache_dir, f"{seg_id}_img_{img_i}")
             if local_p:
                 img_locals.append(local_p)
+        video_locals: list[str] = []
+        for video_i, video_url in enumerate(item.get("video_urls", [])[:2]):
+            local_p = _download_asset(
+                video_url, media_cache_dir, f"{seg_id}_video_{video_i}", default_ext=".mp4",
+            )
+            if local_p:
+                video_locals.append(local_p)
 
         segments.append(
             SegmentItem(
@@ -168,6 +175,8 @@ def scrape_threads_url(
                 spoken_text=item.get("text", "").strip(),
                 image_urls=item.get("image_urls", []),
                 image_locals=img_locals,
+                video_urls=item.get("video_urls", []),
+                video_locals=video_locals,
                 likes=int(item.get("likes", 0)),
                 replies=int(item.get("replies", 0)),
                 reposts=int(item.get("reposts", 0)),
@@ -256,7 +265,8 @@ def _collect_post_objects(payloads: list[Any]) -> list[dict[str, Any]]:
             text = "".join(f.get("plaintext", "") for f in frags if isinstance(f, dict))
         text = (text or "").strip()
         images = _extract_post_images(p)
-        if not username or (not text and not images):
+        videos = _extract_post_videos(p)
+        if not username or (not text and not images and not videos):
             return
         dedup_key = pk or code or f"{username}:{text[:50]}"
         if dedup_key in seen_pks:
@@ -272,6 +282,7 @@ def _collect_post_objects(payloads: list[Any]) -> list[dict[str, Any]]:
                 "avatar_url": user.get("profile_pic_url") or "",
                 "text": text,
                 "image_urls": images,
+                "video_urls": videos,
                 "likes": int(p.get("like_count") or 0),
                 "replies": int(info.get("direct_reply_count") or 0),
                 "reposts": int((info.get("repost_count") or 0) + (info.get("quote_count") or 0)),
@@ -319,6 +330,21 @@ def _extract_post_images(p: dict[str, Any]) -> list[str]:
     return urls
 
 
+def _extract_post_videos(p: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    carousel = p.get("carousel_media") or []
+    for item in (carousel if carousel else [p]):
+        if not isinstance(item, dict):
+            continue
+        for version in item.get("video_versions") or []:
+            if isinstance(version, dict) and version.get("url"):
+                url = str(version["url"])
+                if url not in urls:
+                    urls.append(url)
+                break
+    return urls
+
+
 def _extract_dom_fallback(page) -> list[dict[str, Any]]:
     try:
         return page.evaluate(
@@ -334,17 +360,20 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                     const postMatch = postLink && new URL(postLink.href).pathname.match(/[/]post[/]([A-Za-z0-9_-]+)/);
                     if (!postMatch) return;
                     const avatarImg = el.querySelector('img[alt*="profile"], img');
+                    const video = el.querySelector('video');
                     const spans = Array.from(el.querySelectorAll('span[dir="auto"]'))
                         .map(s => s.innerText.trim())
                         .filter(t => t && t !== username && !/^[0-9.,KMB]+$/.test(t) && t.length > 2);
                     const text = spans.join('\\n').trim();
-                    if (username && text) {
+                    if (username && (text || video)) {
                         results.push({
                             code: postMatch[1],
                             username,
                             avatar_url: avatarImg ? avatarImg.src : '',
                             text,
                             image_urls: [],
+                            video_urls: video && (video.currentSrc || video.src) && !(video.currentSrc || video.src).startsWith('blob:')
+                                ? [video.currentSrc || video.src] : [],
                             likes: 0,
                             replies: 0,
                             reposts: 0
@@ -371,7 +400,7 @@ def _select_comments(
         txt = r.get("text", "")
         if r.get("username") != author and is_spam_comment(txt):
             continue
-        if not txt and not r.get("image_urls"):
+        if not txt and not r.get("image_urls") and not r.get("video_urls"):
             continue
         clean.append(r)
 
@@ -390,17 +419,23 @@ def _select_comments(
     return clean[:max_comments]
 
 
-def _download_asset(url: str, cache_dir: Path, prefix: str) -> str:
+def _download_asset(url: str, cache_dir: Path, prefix: str, *, default_ext: str = "") -> str:
     if not url or not url.startswith("http"):
         return ""
-    ext = ".png" if ".png" in url.lower() else ".jpg"
+    lower_path = urlsplit(url).path.lower()
+    ext = next(
+        (suffix for suffix in (".mp4", ".mov", ".webm", ".png", ".jpg", ".jpeg") if lower_path.endswith(suffix)),
+        default_ext or ".jpg",
+    )
     digest = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
     dest = cache_dir / f"{prefix}_{digest}{ext}"
     if dest.exists() and dest.stat().st_size > 100:
         return str(dest)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.threads.com/"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
             dest.write_bytes(resp.read())
         return str(dest)
     except Exception:

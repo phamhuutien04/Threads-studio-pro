@@ -150,12 +150,20 @@ class SegmentItem:
     spoken_text: str = ""
     image_urls: list[str] = field(default_factory=list)
     image_locals: list[str] = field(default_factory=list)
+    video_urls: list[str] = field(default_factory=list)
+    video_locals: list[str] = field(default_factory=list)
     likes: int = 0
     replies: int = 0
     reposts: int = 0
     enabled: bool = True
     voice_id: str = ""
     card_png_path: str = ""
+    card_width_px: int = 0
+    card_height_px: int = 0
+    card_media_x_px: int = 0
+    card_media_y_px: int = 0
+    card_media_w_px: int = 0
+    card_media_h_px: int = 0
     audio_wav_path: str = ""
     duration_sec: float = 0.0
     start_sec: float = 0.0

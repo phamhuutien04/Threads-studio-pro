@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
+from functools import lru_cache
 from pathlib import Path
+import subprocess
 
 from fluent_blue.compatibility.qt import (
     QBrush,
@@ -26,6 +29,24 @@ from fluent_blue.compatibility.qt import (
 )
 
 from ..core.models import LayoutConfig, SegmentItem
+
+_NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+@lru_cache(maxsize=128)
+def _probe_video_size(path: str) -> tuple[int, int]:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            capture_output=True, text=True, timeout=12, creationflags=_NO_CONSOLE,
+        )
+        streams = json.loads(result.stdout).get("streams", [])
+        video = next(stream for stream in streams if stream.get("codec_type") == "video")
+        width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+        rotation = int((video.get("tags") or {}).get("rotate") or 0) % 180
+        return (height, width) if rotation else (width, height)
+    except Exception:
+        return (16, 9)
 
 
 def format_metric(n: int) -> str:
@@ -57,11 +78,18 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
     doc = _build_body_doc(seg.raw_text, content_w, fg_col)
     text_h = int(doc.size().height()) if seg.raw_text.strip() else 0
 
-    # Optional attached image (chat meme / photo)
+    # Threads media stays inside its card. Video is inserted later by FFmpeg
+    # through a transparent slot with the source aspect ratio preserved.
+    attached_video = next((Path(path) for path in seg.video_locals if Path(path).is_file()), None)
     attached_qimg: QImage | None = None
     attached_draw_h = 0
     attached_draw_w = 0
-    if seg.image_locals:
+    if attached_video is not None:
+        video_w, video_h = _probe_video_size(str(attached_video))
+        scale = min(content_w / max(1, video_w), 520 / max(1, video_h))
+        attached_draw_w = max(1, int(round(video_w * scale)))
+        attached_draw_h = max(1, int(round(video_h * scale)))
+    elif seg.image_locals:
         p = Path(seg.image_locals[0])
         if p.exists():
             loaded = QImage(str(p))
@@ -79,7 +107,7 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
 
     footer_h = 44
     total_h = pad_top + avatar_size + header_gap + text_h
-    if attached_qimg is not None:
+    if attached_video is not None or attached_qimg is not None:
         total_h += 18 + attached_draw_h
     total_h += 22 + footer_h + pad_bottom
 
@@ -141,16 +169,26 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
         painter.restore()
         cursor_y += text_h
 
-    # 5. Attached photo / chat screenshot
-    if attached_qimg is not None:
+    # 5. Attached photo/video between body text and action row.
+    if attached_video is not None or attached_qimg is not None:
         cursor_y += 18
         img_x = float(pad_x) + (content_w - attached_draw_w) * 0.5
         clip = QPainterPath()
         clip.addRoundedRect(QRectF(img_x, cursor_y, attached_draw_w, attached_draw_h), 16, 16)
-        painter.save()
-        painter.setClipPath(clip)
-        painter.drawImage(QPointF(img_x, cursor_y), attached_qimg)
-        painter.restore()
+        if attached_video is not None:
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillPath(clip, Qt.GlobalColor.transparent)
+            painter.restore()
+            seg.card_media_x_px = int(round(img_x))
+            seg.card_media_y_px = int(round(cursor_y))
+            seg.card_media_w_px = attached_draw_w
+            seg.card_media_h_px = attached_draw_h
+        else:
+            painter.save()
+            painter.setClipPath(clip)
+            painter.drawImage(QPointF(img_x, cursor_y), attached_qimg)
+            painter.restore()
         painter.setPen(QPen(border_col, 1.2))
         painter.drawPath(clip)
         cursor_y += attached_draw_h
@@ -160,6 +198,11 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
     _draw_action_bar(painter, float(pad_x), footer_y, seg, muted_col)
 
     painter.end()
+    seg.card_width_px = base_width
+    seg.card_height_px = total_h
+    if attached_video is None:
+        seg.card_media_x_px = seg.card_media_y_px = 0
+        seg.card_media_w_px = seg.card_media_h_px = 0
     return img
 
 
