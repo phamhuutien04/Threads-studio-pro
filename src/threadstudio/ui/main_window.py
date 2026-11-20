@@ -6,9 +6,12 @@ import copy
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import uuid
+import wave
 
 from fluent_blue import (
     Badge,
@@ -117,10 +120,24 @@ class _TopCenterToast:
 Toast = _TopCenterToast
 
 
+class _AudioSeekSlider(Slider):
+    """Seek slider that jumps directly to a clicked point and remains draggable."""
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton and self.width() > 0:
+            ratio = max(0.0, min(1.0, event.position().x() / self.width()))
+            self.setValue(self.minimum() + round(ratio * (self.maximum() - self.minimum())))
+        super().mousePressEvent(event)
+
+
 class _AsyncUiBridge(QObject := QtCore.QObject):
     voice_preview_ready = Signal(str)
     voice_preview_failed = Signal(str)
     login_finished = Signal(str)
+    audio_export_ready = Signal(str)
+    audio_export_failed = Signal(str)
+    audio_save_ready = Signal(str)
+    audio_save_failed = Signal(str)
 
 
 class ThreadsStudioWindow(FluentWindow):
@@ -187,6 +204,7 @@ class ThreadsStudioWindow(FluentWindow):
         self._sidebar.add_section("Sản Xuất")
         self._nav_queue = self._sidebar.add_item("Tạo Lô · Hàng Đợi", key="queue", icon="layers")
         self._nav_inspector = self._sidebar.add_item("Duyệt Kịch Bản", key="inspector", icon="edit")
+        self._nav_audio_export = self._sidebar.add_item("Tạo File Âm Thanh", key="audio_export", icon="volume")
         self._sidebar.add_section("Cấu Hình Studio")
         self._nav_voices = self._sidebar.add_item("Giọng Đọc AI", key="voices", icon="volume")
         self._nav_media = self._sidebar.add_item("Nguồn Video · Nhạc", key="media", icon="folder")
@@ -196,10 +214,11 @@ class ThreadsStudioWindow(FluentWindow):
         self._pages = QStackedWidget()
         self._pages.setMinimumSize(0, 0)
         self._pages.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        self._page_keys = ["queue", "inspector", "voices", "media", "settings"]
+        self._page_keys = ["queue", "inspector", "audio_export", "voices", "media", "settings"]
         page_widgets = [
             self._build_queue_page(),
             self._build_inspector_page(),
+            self._build_audio_export_page(),
             self._build_voices_page(),
             self._build_media_page(),
             self._build_settings_page(),
@@ -573,7 +592,153 @@ class ThreadsStudioWindow(FluentWindow):
         return page
 
     # ------------------------------------------------------------------
-    # Page 3: Multi-Engine AI Voice Studio (CapCut + Edge + VieNeu)
+    # Page 3: Text-to-Audio Only Export
+    # ------------------------------------------------------------------
+
+    def _build_audio_export_page(self) -> QWidget:
+        stale_preview = self.settings.user_data_dir() / "work" / "audio-only-preview.wav"
+        try:
+            stale_preview.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+        for old_preview in stale_preview.parent.glob("audio-preview-*.wav"):
+            try:
+                old_preview.unlink(missing_ok=True)
+            except PermissionError:
+                pass
+        self._audio_preview_path = ""
+        self._audio_preview_request = ""
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, ThemeManager.spacing(2), 0)
+        col.setSpacing(ThemeManager.spacing(2))
+
+        self._btn_normalize_audio_text = Button(
+            "Bung Lại Từ Viết Tắt", size="small", variant="secondary", icon="wand"
+        )
+        panel = Panel(
+            title="Lồng Tiếng Từ Văn Bản · Chỉ Xuất File Âm Thanh",
+            actions=[self._btn_normalize_audio_text],
+            padding=4,
+        )
+        voice_options = [(voice.display_name, voice.full_id) for voice in self._voices]
+        default_voice = self.settings.preview_voice_id
+        if default_voice not in {value for _, value in voice_options} and voice_options:
+            default_voice = voice_options[0][1]
+
+        audio_split = Splitter(orientation="horizontal", collapsible=False)
+        segment_list_panel = Panel(title="Danh Sách Câu · Đọc Theo Thứ Tự", padding=2)
+        self._audio_segments_table = DataTable(
+            columns=[
+                Column("number", "#", width=48, align="center", sortable=False),
+                Column("snippet", "Nội dung", width=300, sortable=False),
+                Column("voice_label", "Giọng", width=150, sortable=False),
+            ],
+            rows=[], page_size=None, selection="single", searchable=False,
+            column_menu=False, exportable=False, empty_title="Chưa có câu nào",
+            empty_description="Bấm Thêm Câu để bắt đầu.", row_height=34,
+        )
+        self._audio_segments_table.setMinimumHeight(230)
+        segment_list_panel.add(self._audio_segments_table)
+        segment_buttons = Stack(direction="horizontal", spacing=2)
+        self._btn_audio_add_segment = Button("Thêm Câu", size="small", variant="primary", icon="plus")
+        self._btn_audio_delete_segment = Button("Xóa Câu", size="small", variant="danger", icon="trash")
+        self._btn_audio_segment_up = Button("Lên", size="small", icon="arrow-up")
+        self._btn_audio_segment_down = Button("Xuống", size="small", icon="arrow-down")
+        for button in (
+            self._btn_audio_add_segment, self._btn_audio_delete_segment,
+            self._btn_audio_segment_up, self._btn_audio_segment_down,
+        ):
+            segment_buttons.add(button)
+        segment_list_panel.add(segment_buttons)
+
+        segment_editor_panel = Panel(title="Nội Dung Và Giọng Của Câu Đang Chọn", padding=3)
+        self._audio_export_text = TextArea(
+            placeholder="Nhập nội dung của câu hoặc đoạn này…",
+            rows=6,
+        )
+        self._audio_export_text.setFixedHeight(180)
+        segment_editor_panel.add(FormField("Nội dung cần đọc", self._audio_export_text))
+        self._audio_export_voice = Select(options=voice_options, value=default_voice)
+        segment_editor_panel.add(FormField("Giọng đọc riêng cho câu này", self._audio_export_voice))
+
+        audio_split.addWidget(segment_list_panel)
+        audio_split.addWidget(segment_editor_panel)
+        audio_split.setSizes([470, 430])
+        panel.add(audio_split)
+
+        self._audio_export_speed = NumberInput(
+            value=self.settings.voice_speed,
+            minimum=0.75,
+            maximum=1.80,
+            step=0.05,
+            decimals=2,
+        )
+        voice_row = Stack(direction="horizontal", spacing=3)
+        voice_row.add(FormField("Tốc độ chung cho toàn bộ file", self._audio_export_speed), 1)
+        voice_row.add_stretch(3)
+        panel.add(voice_row)
+
+        self._audio_export_name = Input(
+            placeholder="Tên file, ví dụ: loi-thoai-quang-cao",
+            clearable=True,
+        )
+        self._audio_export_format = Select(
+            options=[("MP3 · Dung lượng nhẹ", "mp3"), ("WAV · Chất lượng gốc", "wav")],
+            value="mp3",
+        )
+        output_row = Stack(direction="horizontal", spacing=3)
+        output_row.add(FormField("Tên file", self._audio_export_name), 3)
+        output_row.add(FormField("Định dạng", self._audio_export_format), 1)
+        panel.add(output_row)
+
+        self._btn_export_audio_only = Button(
+            "Nghe Thử",
+            variant="primary",
+            size="medium",
+            icon="play",
+        )
+        self._btn_export_audio_only.setFixedWidth(160)
+        self._btn_save_audio_only = Button(
+            "Lưu File Âm Thanh",
+            variant="secondary",
+            size="medium",
+            icon="save",
+        )
+        self._btn_save_audio_only.setFixedWidth(190)
+        self._btn_save_audio_only.setEnabled(False)
+        audio_actions = Stack(direction="horizontal", spacing=2)
+        audio_actions.add(self._btn_export_audio_only)
+        audio_actions.add(self._btn_save_audio_only)
+        audio_actions.add_stretch(1)
+        panel.add(audio_actions)
+
+        audio_seek_row = Stack(direction="horizontal", spacing=2, align="center")
+        self._audio_seek_slider = _AudioSeekSlider(value=0, minimum=0, maximum=1, disabled=True)
+        self._audio_time_label = Text("00:00 / 00:00", color="text-secondary")
+        self._audio_time_label.setMinimumWidth(105)
+        audio_seek_row.add(self._audio_seek_slider, 1)
+        audio_seek_row.add(self._audio_time_label)
+        panel.add(audio_seek_row)
+        panel.add(
+            Text(
+                "File hoàn thành được lưu trực tiếp trong thư mục Kết quả; không tạo video hay giữ dữ liệu tạm.",
+                color="text-secondary",
+                wrap=True,
+            )
+        )
+        self._audio_segments = [
+            {"text": "", "voice_id": default_voice, "voice_label": self._voice_label_by_id.get(default_voice, "Giọng đọc")}
+        ]
+        self._current_audio_segment = 0
+        self._syncing_audio_segment = False
+        self._refresh_audio_segments_table(select_index=0)
+        col.addWidget(panel)
+        col.addStretch(1)
+        return page
+
+    # ------------------------------------------------------------------
+    # Page 4: Multi-Engine AI Voice Studio (CapCut + Edge + VieNeu)
     # ------------------------------------------------------------------
 
     def _build_voices_page(self) -> QWidget:
@@ -1109,6 +1274,28 @@ class ThreadsStudioWindow(FluentWindow):
         self._bridge.voice_preview_ready.connect(self._on_voice_preview_ready)
         self._bridge.voice_preview_failed.connect(self._on_voice_preview_failed)
         self._bridge.login_finished.connect(lambda msg: Toast.show(msg, parent=self, variant="success"))
+        self._btn_export_audio_only.clicked.connect(self._audio_primary_action)
+        self._btn_save_audio_only.clicked.connect(self._save_audio_only)
+        self._btn_normalize_audio_text.clicked.connect(self._normalize_audio_export_text)
+        self._audio_player.playbackStateChanged.connect(self._on_audio_preview_playback_state_changed)
+        self._audio_player.positionChanged.connect(self._on_audio_preview_position_changed)
+        self._audio_player.durationChanged.connect(self._on_audio_preview_duration_changed)
+        self._audio_seek_slider.sliderReleased.connect(self._seek_audio_preview)
+        self._audio_seek_slider.sliderPressed.connect(self._seek_audio_preview)
+        self._bridge.audio_export_ready.connect(self._on_audio_export_ready)
+        self._bridge.audio_export_failed.connect(self._on_audio_export_failed)
+        self._bridge.audio_save_ready.connect(self._on_audio_save_ready)
+        self._bridge.audio_save_failed.connect(self._on_audio_save_failed)
+        self._audio_export_text.text_changed.connect(self._invalidate_audio_preview)
+        self._audio_export_voice.value_changed.connect(self._invalidate_audio_preview)
+        self._audio_export_speed.value_changed.connect(self._invalidate_audio_preview)
+        self._audio_export_text.text_changed.connect(self._on_audio_segment_edited)
+        self._audio_export_voice.value_changed.connect(self._on_audio_segment_edited)
+        self._audio_segments_table.selection_changed.connect(self._on_audio_segment_selected)
+        self._btn_audio_add_segment.clicked.connect(self._add_audio_segment)
+        self._btn_audio_delete_segment.clicked.connect(self._delete_audio_segment)
+        self._btn_audio_segment_up.clicked.connect(lambda: self._move_audio_segment(-1))
+        self._btn_audio_segment_down.clicked.connect(lambda: self._move_audio_segment(1))
 
         # Layout & Canvas live sync
         self._canvas.layout_edited.connect(self._sync_layout_spinners_from_cfg)
@@ -1166,6 +1353,15 @@ class ThreadsStudioWindow(FluentWindow):
     def _on_nav_changed(self, key: str) -> None:
         if key in self._page_keys:
             self._pages.setCurrentIndex(self._page_keys.index(key))
+        if hasattr(self, "_stage_scroll"):
+            audio_only = key == "audio_export"
+            self._stage_scroll.setVisible(not audio_only)
+            if audio_only:
+                self._pages.setMaximumHeight(16777215)
+                self._center_stage_splitter.setSizes([max(700, self._center_stage_splitter.width()), 0])
+            else:
+                self._responsive_mode = ""
+                self._apply_responsive_layout(self.width(), self.height())
 
     def _on_theme_toggled(self, is_dark: bool) -> None:
         target = "dark" if is_dark else "light"
@@ -1782,6 +1978,332 @@ class ThreadsStudioWindow(FluentWindow):
         self._btn_audition_play.set_loading(False)
         self._btn_preview_seg_voice.set_loading(False)
         Toast.show(f"Không phát được giọng thử: {err}", parent=self, variant="error")
+
+    def _refresh_audio_segments_table(self, *, select_index: int | None = None) -> None:
+        rows = []
+        for index, segment in enumerate(self._audio_segments):
+            text = str(segment.get("text", "")).strip()
+            rows.append(
+                {
+                    "number": index + 1,
+                    "snippet": text[:90] if text else "(Câu mới chưa có nội dung)",
+                    "voice_label": segment.get("voice_label", "Giọng đọc"),
+                    "source_index": index,
+                }
+            )
+        self._audio_segments_table.set_rows(rows)
+        if rows:
+            target = min(select_index if select_index is not None else self._current_audio_segment, len(rows) - 1)
+            self._audio_segments_table.select_rows([target])
+            self._load_audio_segment(target)
+
+    def _load_audio_segment(self, index: int) -> None:
+        if not (0 <= index < len(self._audio_segments)):
+            return
+        self._current_audio_segment = index
+        segment = self._audio_segments[index]
+        self._syncing_audio_segment = True
+        try:
+            self._audio_export_text.set_text(str(segment.get("text", "")))
+            self._audio_export_voice.set_value(str(segment.get("voice_id", "")))
+        finally:
+            self._syncing_audio_segment = False
+
+    def _on_audio_segment_selected(self, rows: list[dict]) -> None:
+        if rows:
+            self._load_audio_segment(int(rows[0].get("source_index", 0)))
+
+    def _on_audio_segment_edited(self, *_args) -> None:
+        if self._syncing_audio_segment or not self._audio_segments:
+            return
+        index = min(self._current_audio_segment, len(self._audio_segments) - 1)
+        voice_id = str(self._audio_export_voice.value() or "edge:vi-VN-HoaiMyNeural")
+        self._audio_segments[index] = {
+            "text": self._audio_export_text.text(),
+            "voice_id": voice_id,
+            "voice_label": self._voice_label_by_id.get(voice_id, voice_id),
+        }
+        rows = self._audio_segments_table.rows()
+        if index < len(rows):
+            text = self._audio_segments[index]["text"].strip()
+            rows[index]["snippet"] = text[:90] if text else "(Câu mới chưa có nội dung)"
+            rows[index]["voice_label"] = self._audio_segments[index]["voice_label"]
+            self._audio_segments_table.model.dataChanged.emit(
+                self._audio_segments_table.model.index(index, 0),
+                self._audio_segments_table.model.index(index, 2),
+            )
+
+    def _add_audio_segment(self) -> None:
+        current_voice = str(self._audio_export_voice.value() or "edge:vi-VN-HoaiMyNeural")
+        self._audio_segments.append(
+            {"text": "", "voice_id": current_voice, "voice_label": self._voice_label_by_id.get(current_voice, current_voice)}
+        )
+        self._invalidate_audio_preview()
+        self._refresh_audio_segments_table(select_index=len(self._audio_segments) - 1)
+
+    def _delete_audio_segment(self) -> None:
+        if len(self._audio_segments) <= 1:
+            self._audio_segments[0]["text"] = ""
+            self._refresh_audio_segments_table(select_index=0)
+            return
+        index = min(self._current_audio_segment, len(self._audio_segments) - 1)
+        self._audio_segments.pop(index)
+        self._invalidate_audio_preview()
+        self._refresh_audio_segments_table(select_index=max(0, index - 1))
+
+    def _move_audio_segment(self, direction: int) -> None:
+        index = self._current_audio_segment
+        target = index + direction
+        if not (0 <= index < len(self._audio_segments)) or not (0 <= target < len(self._audio_segments)):
+            return
+        self._audio_segments[index], self._audio_segments[target] = self._audio_segments[target], self._audio_segments[index]
+        self._invalidate_audio_preview()
+        self._refresh_audio_segments_table(select_index=target)
+
+    def _audio_primary_action(self) -> None:
+        preview = Path(self._audio_preview_path) if self._audio_preview_path else None
+        if preview and preview.is_file() and self._audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._audio_player.pause()
+            self._btn_export_audio_only.setText("Nghe Thử")
+        elif preview and preview.is_file():
+            current_source = self._audio_player.source().toLocalFile()
+            same_source = False
+            if current_source:
+                try:
+                    same_source = Path(current_source).resolve() == preview.resolve()
+                except OSError:
+                    same_source = os.path.normcase(current_source) == os.path.normcase(str(preview))
+            if not same_source:
+                self._audio_player.setSource(QUrl.fromLocalFile(str(preview)))
+            if self._audio_player.duration() > 0 and self._audio_player.position() >= self._audio_player.duration() - 100:
+                self._audio_player.setPosition(0)
+            self._audio_player.play()
+            self._btn_export_audio_only.setText("Dừng Nghe")
+        else:
+            self._export_audio_only()
+
+    def _normalize_audio_export_text(self) -> None:
+        from ..ai.text_normalizer import normalize_teencode_offline
+
+        self._on_audio_segment_edited()
+        if not any(str(segment.get("text", "")).strip() for segment in self._audio_segments):
+            Toast.show("Hãy nhập nội dung trước khi bung từ viết tắt.", parent=self, variant="warning")
+            return
+        for segment in self._audio_segments:
+            raw_text = str(segment.get("text", "")).strip()
+            if raw_text:
+                segment["text"] = normalize_teencode_offline(raw_text)
+        self._invalidate_audio_preview()
+        self._refresh_audio_segments_table(select_index=self._current_audio_segment)
+        Toast.show("Đã bung từ viết tắt cho toàn bộ câu.", parent=self, variant="success")
+
+    def _export_audio_only(self) -> None:
+        self._on_audio_segment_edited()
+        segments = [copy.deepcopy(segment) for segment in self._audio_segments if str(segment.get("text", "")).strip()]
+        if not segments:
+            Toast.show("Hãy nhập ít nhất một câu cần đọc.", parent=self, variant="warning")
+            return
+        speed = float(self._audio_export_speed.value())
+        preview_dir = self.settings.user_data_dir() / "work"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        self._release_audio_preview()
+        preview_wav = preview_dir / f"audio-preview-{uuid.uuid4().hex[:10]}.wav"
+        self._audio_preview_request = str(preview_wav)
+        self._btn_export_audio_only.set_loading(True)
+
+        def _worker() -> None:
+            segment_wavs: list[Path] = []
+            try:
+                router = self.pipeline._make_tts_router()
+                for index, segment in enumerate(segments):
+                    segment_wav = preview_dir / f"audio-part-{preview_wav.stem}-{index:03d}.wav"
+                    router.synthesize_single(
+                        str(segment["text"]).strip(),
+                        str(segment.get("voice_id") or "edge:vi-VN-HoaiMyNeural"),
+                        segment_wav,
+                        speed=speed,
+                    )
+                    segment_wavs.append(segment_wav)
+                self._join_audio_segments(segment_wavs, preview_wav)
+                self._bridge.audio_export_ready.emit(str(preview_wav))
+            except Exception as exc:
+                preview_wav.unlink(missing_ok=True)
+                self._bridge.audio_export_failed.emit(str(exc))
+            finally:
+                for segment_wav in segment_wavs:
+                    segment_wav.unlink(missing_ok=True)
+
+        self._ui_pool.submit(_worker)
+
+    @staticmethod
+    def _join_audio_segments(segment_wavs: list[Path], destination: Path) -> None:
+        if not segment_wavs:
+            raise RuntimeError("Không có đoạn âm thanh để ghép.")
+        with wave.open(str(segment_wavs[0]), "rb") as first:
+            channels = first.getnchannels()
+            sample_width = first.getsampwidth()
+            frame_rate = first.getframerate()
+        silence = b"\x00" * int(frame_rate * 0.18) * channels * sample_width
+        with wave.open(str(destination), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(sample_width)
+            output.setframerate(frame_rate)
+            for index, source in enumerate(segment_wavs):
+                with wave.open(str(source), "rb") as audio:
+                    if (
+                        audio.getnchannels() != channels
+                        or audio.getsampwidth() != sample_width
+                        or audio.getframerate() != frame_rate
+                    ):
+                        raise RuntimeError("Các đoạn giọng đọc không cùng định dạng âm thanh.")
+                    output.writeframes(audio.readframes(audio.getnframes()))
+                if index < len(segment_wavs) - 1:
+                    output.writeframes(silence)
+
+    def _on_audio_export_ready(self, audio_path: str) -> None:
+        self._btn_export_audio_only.set_loading(False)
+        if getattr(self, "_audio_preview_request", "") != audio_path:
+            self._unlink_audio_preview(Path(audio_path))
+            return
+        self._audio_preview_path = audio_path
+        self._btn_export_audio_only.setText("Dừng Nghe")
+        self._btn_save_audio_only.setEnabled(True)
+        self._audio_player.stop()
+        self._audio_player.setSource(QUrl.fromLocalFile(audio_path))
+        self._audio_player.play()
+        self._audio_seek_slider.setEnabled(True)
+        Toast.show("Đang phát bản nghe thử · Nếu thấy ổn, bấm Lưu File Âm Thanh.", parent=self, variant="success")
+
+    def _on_audio_export_failed(self, error: str) -> None:
+        self._btn_export_audio_only.set_loading(False)
+        self._audio_preview_request = ""
+        self._btn_export_audio_only.setText("Nghe Thử")
+        self._btn_save_audio_only.setEnabled(False)
+        Toast.show(f"Không tạo được file âm thanh: {error}", parent=self, variant="error")
+
+    def _invalidate_audio_preview(self, *_args) -> None:
+        if getattr(self, "_syncing_audio_segment", False):
+            return
+        self._audio_preview_request = ""
+        self._release_audio_preview()
+        self._btn_export_audio_only.setText("Nghe Thử")
+        self._btn_save_audio_only.setEnabled(False)
+
+    def _release_audio_preview(self) -> None:
+        old_path = Path(self._audio_preview_path) if self._audio_preview_path else None
+        self._audio_player.stop()
+        self._audio_player.setSource(QUrl())
+        self._audio_seek_slider.setEnabled(False)
+        self._audio_seek_slider.setRange(0, 1)
+        self._audio_seek_slider.setValue(0)
+        self._audio_time_label.setText("00:00 / 00:00")
+        self._audio_preview_path = ""
+        self._btn_export_audio_only.setText("Nghe Thử")
+        self._btn_export_audio_only.set_variant("primary")
+        self._btn_export_audio_only.set_icon("play")
+        if old_path:
+            QtCore.QTimer.singleShot(200, lambda path=old_path: self._unlink_audio_preview(path))
+
+    def _on_audio_preview_playback_state_changed(self, state) -> None:
+        if not self._audio_preview_path:
+            return
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._btn_export_audio_only.setText("Dừng Nghe" if playing else "Nghe Thử")
+        self._btn_export_audio_only.set_variant("danger" if playing else "primary")
+        self._btn_export_audio_only.set_icon("stop" if playing else "play")
+
+    def _on_audio_preview_duration_changed(self, duration_ms: int) -> None:
+        if not self._audio_preview_path:
+            return
+        self._audio_seek_slider.setRange(0, max(1, duration_ms))
+        self._audio_seek_slider.setEnabled(duration_ms > 0)
+        self._update_audio_time_label(self._audio_player.position(), duration_ms)
+
+    def _on_audio_preview_position_changed(self, position_ms: int) -> None:
+        if not self._audio_preview_path:
+            return
+        if not self._audio_seek_slider.isSliderDown():
+            self._audio_seek_slider.setValue(position_ms)
+        duration_ms = max(self._audio_player.duration(), self._audio_seek_slider.maximum())
+        self._update_audio_time_label(position_ms, duration_ms)
+
+    def _seek_audio_preview(self) -> None:
+        if self._audio_preview_path:
+            self._audio_player.setPosition(self._audio_seek_slider.value())
+
+    def _update_audio_time_label(self, position_ms: int, duration_ms: int) -> None:
+        self._audio_time_label.setText(
+            f"{self._format_audio_time(position_ms)} / {self._format_audio_time(duration_ms)}"
+        )
+
+    @staticmethod
+    def _format_audio_time(milliseconds: int) -> str:
+        total_seconds = max(0, int(milliseconds) // 1000)
+        return f"{total_seconds // 60:02d}:{total_seconds % 60:02d}"
+
+    def _unlink_audio_preview(self, path: Path, attempt: int = 0) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            if attempt < 10:
+                QtCore.QTimer.singleShot(
+                    200,
+                    lambda target=path, retry=attempt + 1: self._unlink_audio_preview(target, retry),
+                )
+
+    def _save_audio_only(self) -> None:
+        preview_wav = Path(getattr(self, "_audio_preview_path", ""))
+        if not preview_wav.is_file():
+            Toast.show("Hãy nghe thử nội dung trước khi lưu.", parent=self, variant="warning")
+            self._btn_save_audio_only.setEnabled(False)
+            return
+        audio_format = str(self._audio_export_format.value() or "mp3")
+        raw_name = self._audio_export_name.text().strip()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._-")
+        if not safe_name:
+            safe_name = f"audio-{QtCore.QDateTime.currentDateTime().toString('yyyyMMdd-HHmmss')}"
+        output_root = self.settings.resolved_output_root()
+        destination = output_root / f"{safe_name}.{audio_format}"
+        counter = 2
+        while destination.exists():
+            destination = output_root / f"{safe_name}-{counter}.{audio_format}"
+            counter += 1
+        self._btn_save_audio_only.set_loading(True)
+
+        def _worker() -> None:
+            try:
+                if audio_format == "wav":
+                    shutil.copy2(preview_wav, destination)
+                else:
+                    result = subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-v", "error", "-i", str(preview_wav),
+                            "-c:a", "libmp3lame", "-b:a", "192k", str(destination),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    if result.returncode != 0 or not destination.exists():
+                        raise RuntimeError(f"Không chuyển được sang MP3: {result.stderr[-300:]}")
+                self._bridge.audio_save_ready.emit(str(destination))
+            except Exception as exc:
+                destination.unlink(missing_ok=True)
+                self._bridge.audio_save_failed.emit(str(exc))
+
+        self._ui_pool.submit(_worker)
+
+    def _on_audio_save_ready(self, audio_path: str) -> None:
+        self._btn_save_audio_only.set_loading(False)
+        self._release_audio_preview()
+        self._audio_preview_request = ""
+        self._btn_export_audio_only.setText("Nghe Thử")
+        self._btn_save_audio_only.setEnabled(False)
+        Toast.show(f"Đã lưu file âm thanh: {Path(audio_path).name}", parent=self, variant="success")
+
+    def _on_audio_save_failed(self, error: str) -> None:
+        self._btn_save_audio_only.set_loading(False)
+        Toast.show(f"Không lưu được file âm thanh: {error}", parent=self, variant="error")
 
     # ------------------------------------------------------------------
     # Stage Layout Sync & Presets
