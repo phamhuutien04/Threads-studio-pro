@@ -61,6 +61,13 @@ def list_media_files(folder: str, exts: set[str]) -> list[Path]:
     return sorted([f for f in p.iterdir() if f.is_file() and f.suffix.lower() in exts])
 
 
+def selected_file(path: str, exts: set[str]) -> list[Path]:
+    candidate = Path(path) if path else None
+    if candidate and candidate.is_file() and candidate.suffix.lower() in exts:
+        return [candidate]
+    return []
+
+
 def compose_final_video(
     job: VideoJob,
     out_dir: Path,
@@ -91,9 +98,11 @@ def compose_final_video(
     )
 
     # 2. Pick background video
-    bg_candidates = list_media_files(job.media.bg_video_dir, VIDEO_EXTS)
+    bg_candidates = selected_file(job.media.bg_video_file, VIDEO_EXTS)
     if not bg_candidates:
-        raise RuntimeError(f"Không tìm thấy video nền (.mp4) trong thư mục: {job.media.bg_video_dir}")
+        bg_candidates = list_media_files(job.media.bg_video_dir, VIDEO_EXTS)
+    if not bg_candidates:
+        raise RuntimeError("Chưa chọn video nền hợp lệ hoặc thư mục video nền không có video.")
     bg_video = random.choice(bg_candidates)
 
     # 3. Prepare concatenated muted B-roll stream if `sub_enabled`
@@ -196,7 +205,9 @@ def _mix_master_audio(
 ) -> tuple[str, list[str]]:
     """Mix narration (100%) + looped BGM (bgm_volume_pct) + transition SFX (sfx_volume_pct)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    bgm_files = list_media_files(media.bgm_dir, AUDIO_EXTS) if media.bgm_enabled else []
+    bgm_files = selected_file(media.bgm_file, AUDIO_EXTS) if media.bgm_enabled else []
+    if media.bgm_enabled and not bgm_files:
+        bgm_files = list_media_files(media.bgm_dir, AUDIO_EXTS)
     sfx_files = list_media_files(media.sfx_dir, AUDIO_EXTS) if media.sfx_enabled else []
 
     chosen_bgm = str(random.choice(bgm_files)) if bgm_files else ""

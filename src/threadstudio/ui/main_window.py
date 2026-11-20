@@ -6,6 +6,7 @@ import copy
 import logging
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -16,6 +17,7 @@ from fluent_blue import (
     Column,
     Command,
     CommandPalette,
+    ConfirmDialog,
     DataTable,
     Divider,
     FilePicker,
@@ -45,6 +47,7 @@ from fluent_blue import (
 )
 from fluent_blue.compatibility.qt import (
     QApplication,
+    QAbstractItemView,
     QAudioOutput,
     QDesktopServices,
     QHBoxLayout,
@@ -57,8 +60,9 @@ from fluent_blue.compatibility.qt import (
     QVBoxLayout,
     QWidget,
 )
+from fluent_blue.components.feedback.feedback import ToastCard, _OverlayHost
 
-from ..core.config import AppSettings
+from ..core.config import AppSettings, project_root
 from ..core.models import (
     CommentMode,
     JobStage,
@@ -79,6 +83,38 @@ from .widgets.video_player import StudioVideoPlayer
 Signal = getattr(QtCore, "pyqtSignal", None) or getattr(QtCore, "Signal")
 logger = logging.getLogger("threadstudio")
 logger.setLevel(logging.INFO)
+
+
+class _TopCenterToastHost(_OverlayHost):
+    """Fluent toast stack anchored at the horizontal top center."""
+
+    def _relayout(self) -> None:
+        super()._relayout()
+        self.move((self._window.width() - self.width()) // 2, 0)
+
+
+class _TopCenterToast:
+    @staticmethod
+    def show(message: str, parent=None, *, variant: str = "info", duration: int = 3500) -> ToastCard:
+        window = parent.window() if parent is not None else QApplication.activeWindow()
+        if window is None:
+            raise ValueError("Cần cửa sổ ứng dụng để hiển thị thông báo.")
+        name = "_threadstudio_top_center_toasts"
+        host = window.findChild(
+            _TopCenterToastHost,
+            name,
+            Qt.FindChildOption.FindDirectChildrenOnly,
+        )
+        if host is None:
+            host = _TopCenterToastHost(window, "top-center")
+            host.setObjectName(name)
+        card = ToastCard(message=message, variant=variant, duration=duration)
+        host.add(card)
+        return card
+
+
+# All existing Toast.show(...) calls now share the same top-center placement.
+Toast = _TopCenterToast
 
 
 class _AsyncUiBridge(QObject := QtCore.QObject):
@@ -140,10 +176,7 @@ class ThreadsStudioWindow(FluentWindow):
         # 1. Top Operational Action Bar
         root_col.addWidget(self._build_top_bar())
 
-        # 2. Main Body + Collapsible Log Splitter (Vertical)
-        self._body_log_splitter = Splitter(orientation="vertical", collapsible=True)
-
-        # Horizontal 3-Zone Workspace: Sidebar | Center Pages | Right 9:16 Stage
+        # 2. Horizontal 3-Zone Workspace: Sidebar | Center Pages | Right 9:16 Stage
         self._workspace_holder = QWidget()
         self._workspace_holder.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         ws_row = QHBoxLayout(self._workspace_holder)
@@ -164,16 +197,23 @@ class ThreadsStudioWindow(FluentWindow):
         self._pages.setMinimumSize(0, 0)
         self._pages.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._page_keys = ["queue", "inspector", "voices", "media", "settings"]
-        self._pages.addWidget(self._build_queue_page())
-        self._pages.addWidget(self._build_inspector_page())
-        self._pages.addWidget(self._build_voices_page())
-        self._pages.addWidget(self._build_media_page())
-        self._pages.addWidget(self._build_settings_page())
+        page_widgets = [
+            self._build_queue_page(),
+            self._build_inspector_page(),
+            self._build_voices_page(),
+            self._build_media_page(),
+            self._build_settings_page(),
+        ]
+        for page in page_widgets:
+            if isinstance(page, ScrollArea):
+                page.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self._pages.addWidget(page)
 
         self._stage_panel = self._build_right_stage_panel()
         self._stage_panel.setMinimumSize(0, 0)
         self._stage_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._stage_scroll = ScrollArea(self._stage_panel)
+        self._stage_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._stage_scroll.setMinimumSize(0, 0)
         self._stage_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._center_stage_splitter = Splitter(
@@ -184,13 +224,12 @@ class ThreadsStudioWindow(FluentWindow):
         )
         ws_row.addWidget(self._center_stage_splitter, 1)
 
-        # Bottom Multi-Threaded Log Panel
+        # Keep an invisible logger sink for diagnostics; the technical log panel
+        # is intentionally removed from the user-facing interface.
         self._log_panel = self._build_log_panel()
-        self._body_log_splitter.addWidget(self._workspace_holder)
-        self._body_log_splitter.addWidget(self._log_panel)
-        self._body_log_splitter.setSizes([665, 195])
+        self._log_panel.hide()
 
-        root_col.addWidget(self._body_log_splitter, 1)
+        root_col.addWidget(self._workspace_holder, 1)
         self.set_central_widget(root)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -214,8 +253,10 @@ class ThreadsStudioWindow(FluentWindow):
                 self._canvas.setMinimumSize(180, 220)
                 self._center_stage_splitter.setOrientation(Qt.Orientation.Vertical)
                 available = max(500, self._center_stage_splitter.height())
-                self._pages.setMaximumHeight(max(190, int(available * 0.38)))
-                self._center_stage_splitter.setSizes([int(available * 0.38), int(available * 0.62)])
+                # Prioritize the working form on narrow screens so the entire
+                # queue page fits without any scrolling. The stage stays below.
+                self._pages.setMaximumHeight(max(520, int(available * 0.82)))
+                self._center_stage_splitter.setSizes([int(available * 0.82), int(available * 0.18)])
             elif mode == "medium":
                 self._pages.setMaximumHeight(16777215)
                 self._canvas.setMinimumSize(220, 360)
@@ -236,13 +277,12 @@ class ThreadsStudioWindow(FluentWindow):
                 available = max(900, self._center_stage_splitter.width())
                 self._center_stage_splitter.setSizes([int(available * 0.60), int(available * 0.40)])
 
-        short = height < 780
-        if short and not self._log_is_compact:
-            self._log_is_compact = True
-            self._body_log_splitter.setSizes([max(500, height - 70), 0])
-        elif not short and self._log_is_compact:
-            self._log_is_compact = False
-            self._body_log_splitter.setSizes([max(500, height - 210), 180])
+        # Resize events can arrive before Qt has assigned the splitter its final
+        # height. Recalculate on every event while compact, not only on mode change.
+        if mode == "compact":
+            available = max(500, self._center_stage_splitter.height())
+            self._pages.setMaximumHeight(max(520, int(available * 0.82)))
+            self._center_stage_splitter.setSizes([int(available * 0.82), int(available * 0.18)])
 
     def _build_top_bar(self) -> QWidget:
         bar = QWidget()
@@ -295,11 +335,10 @@ class ThreadsStudioWindow(FluentWindow):
     # ------------------------------------------------------------------
 
     def _build_queue_page(self) -> QWidget:
-        scroll = ScrollArea()
         container = QWidget()
         col = QVBoxLayout(container)
-        col.setContentsMargins(0, 0, ThemeManager.spacing(2), 0)
-        col.setSpacing(ThemeManager.spacing(3))
+        col.setContentsMargins(0, 0, ThemeManager.spacing(1), 0)
+        col.setSpacing(ThemeManager.spacing(2))
 
         # Section A: Batch Input Panel
         btn_demo = Button("Bài Mẫu Video 1", size="small", variant="secondary", icon="zap")
@@ -308,7 +347,7 @@ class ThreadsStudioWindow(FluentWindow):
         ingest_panel = Panel(
             title="Nhập Bài Viết Threads (Đơn Lẻ Hoặc Chạy Lô)",
             actions=[btn_login_quick, btn_demo, btn_paste],
-            padding=3,
+            padding=2,
         )
 
         self._input_mode_seg = SegmentedControl(
@@ -327,6 +366,7 @@ class ThreadsStudioWindow(FluentWindow):
             ),
             rows=4,
         )
+        self._batch_input_area.setFixedHeight(138)
         ingest_panel.add(self._batch_input_area)
 
         # Quick row: Comment mode, comment count, speed
@@ -395,7 +435,7 @@ class ThreadsStudioWindow(FluentWindow):
                 self._btn_watch_selected,
                 self._btn_stop_all,
             ],
-            padding=3,
+            padding=2,
         )
 
         self._batch_progress = ProgressBar(value=0, show_label=True, thickness=6)
@@ -418,7 +458,7 @@ class ThreadsStudioWindow(FluentWindow):
             empty_title="Chưa có video nào trong hàng đợi",
             empty_description="Dán danh sách link Threads hoặc bấm 'Nạp Bài Mẫu Video 1' để chạy thử ngay.",
         )
-        self._queue_table.setMinimumHeight(290)
+        self._queue_table.setMinimumHeight(185)
         queue_panel.add(self._queue_table)
         col.addWidget(queue_panel, 1)
 
@@ -427,8 +467,7 @@ class ThreadsStudioWindow(FluentWindow):
         btn_paste.clicked.connect(self._paste_links_from_clipboard)
         btn_login_quick.clicked.connect(self._start_threads_login)
 
-        scroll.setWidget(container)
-        return scroll
+        return container
 
     # ------------------------------------------------------------------
     # Page 2: Inline Script & Teencode Inspector (No Blocking Modal!)
@@ -645,6 +684,12 @@ class ThreadsStudioWindow(FluentWindow):
         col.setContentsMargins(0, 0, ThemeManager.spacing(2), 0)
         col.setSpacing(ThemeManager.spacing(3))
 
+        # These are application-managed libraries; users add files through the
+        # UI and never need to browse or configure their folder paths.
+        self.settings.media.bg_video_dir = str(self._managed_media_library("video nền"))
+        self.settings.media.sub_video_dir = str(self._managed_media_library("video phụ"))
+        self.settings.media.bgm_dir = str(self._managed_media_library("nhạc nền"))
+
         btn_save_preset = Button("Lưu Preset Mới", size="small", variant="primary", icon="save")
         self._btn_delete_preset = Button("Xóa Preset", size="small", variant="danger", icon="trash")
         folders_panel = Panel(
@@ -653,9 +698,46 @@ class ThreadsStudioWindow(FluentWindow):
             padding=4,
         )
 
-        self._picker_bg = FilePicker(mode="directory", button_text="Chọn thư mục")
-        self._picker_bg.set_paths([self.settings.media.bg_video_dir])
-        folders_panel.add(FormField("Thư mục Video Nền 9:16 (Ví dụ: nền lưới 3D ô vuông)", self._picker_bg))
+        self._picker_bg_file = FilePicker(
+            mode="open-multiple",
+            filter="Video (*.mp4 *.mov *.mkv *.webm *.avi)",
+            placeholder="Các video đã thêm sẽ được ứng dụng tự quản lý…",
+            button_text="Thêm Video Nền",
+        )
+        self._bg_library_status = Text("", color="text-secondary")
+
+        self._btn_add_bg_library = Button(
+            "Thêm Video Nền", size="small", variant="primary", icon="plus"
+        )
+        self._btn_preview_bg_library = Button(
+            "Xem Video Đã Chọn", size="small", variant="outline", icon="play"
+        )
+        self._btn_delete_bg_library = Button("Xóa Đã Chọn", size="small", variant="danger", icon="trash")
+        video_library_panel = Panel(
+            title="Tất Cả Video Nền Đã Thêm",
+            actions=[self._btn_add_bg_library, self._btn_preview_bg_library, self._btn_delete_bg_library],
+            padding=2,
+        )
+        video_library_panel.add(self._bg_library_status)
+        self._bg_library_table = DataTable(
+            columns=[
+                Column("checked", "", width=44, sortable=False, align="center"),
+                Column("name", "Tên video", width=360),
+                Column("size", "Dung lượng", width=110, align="right"),
+            ],
+            rows=[],
+            page_size=None,
+            selection="single",
+            searchable=True,
+            exportable=False,
+            empty_title="Chưa thêm video nền",
+            empty_description="Bấm 'Thêm Video Nền' để đưa video vào ứng dụng.",
+            row_height=34,
+        )
+        self._bg_library_table.setMinimumHeight(170)
+        self._enable_checkbox_selection(self._bg_library_table)
+        video_library_panel.add(self._bg_library_table)
+        folders_panel.add(video_library_panel)
 
         self._chk_sub_video = Checkbox(
             "Bật Video Phụ (Meme / Anime / Gameplay tắt tiếng gốc)",
@@ -663,15 +745,68 @@ class ThreadsStudioWindow(FluentWindow):
         )
         folders_panel.add(self._chk_sub_video)
 
-        self._picker_sub = FilePicker(mode="directory", button_text="Chọn thư mục")
-        self._picker_sub.set_paths([self.settings.media.sub_video_dir])
-        folders_panel.add(FormField("Thư mục Video Phụ (Tự cắt ghép ngẫu nhiên)", self._picker_sub))
+        self._picker_sub_file = FilePicker(
+            mode="open-multiple",
+            filter="Video (*.mp4 *.mov *.mkv *.webm *.avi)",
+            button_text="Thêm Video Phụ",
+        )
+        self._sub_library_status = Text("", color="text-secondary")
+        self._btn_add_sub_library = Button("Thêm Video Phụ", size="small", variant="primary", icon="plus")
+        self._btn_preview_sub_library = Button("Xem Video Đã Chọn", size="small", variant="outline", icon="play")
+        self._btn_delete_sub_library = Button("Xóa Đã Chọn", size="small", variant="danger", icon="trash")
+        sub_library_panel = Panel(
+            title="Tất Cả Video Phụ · Meme · Anime · Gameplay",
+            actions=[self._btn_add_sub_library, self._btn_preview_sub_library, self._btn_delete_sub_library],
+            padding=2,
+        )
+        sub_library_panel.add(self._sub_library_status)
+        self._sub_library_table = DataTable(
+            columns=[
+                Column("checked", "", width=44, sortable=False, align="center"),
+                Column("name", "Tên video", width=360),
+                Column("size", "Dung lượng", width=110, align="right"),
+            ],
+            rows=[], page_size=None, selection="single", searchable=True,
+            exportable=False, empty_title="Chưa thêm video phụ",
+            empty_description="Bấm 'Thêm Video Phụ' để đưa video vào ứng dụng.", row_height=34,
+        )
+        self._sub_library_table.setMinimumHeight(150)
+        self._enable_checkbox_selection(self._sub_library_table)
+        sub_library_panel.add(self._sub_library_table)
+        folders_panel.add(sub_library_panel)
 
         folders_panel.add(Divider())
 
-        self._picker_bgm = FilePicker(mode="directory", button_text="Chọn thư mục")
-        self._picker_bgm.set_paths([self.settings.media.bgm_dir])
-        folders_panel.add(FormField("Thư mục Nhạc Nền (Kể chuyện / Hài hước)", self._picker_bgm))
+        self._picker_bgm_file = FilePicker(
+            mode="open-multiple",
+            filter="Âm thanh (*.mp3 *.wav *.m4a *.aac *.ogg *.flac)",
+            placeholder="Các bài nhạc đã thêm sẽ được ứng dụng tự quản lý…",
+            button_text="Thêm Nhạc Nền",
+        )
+        self._bgm_library_status = Text("", color="text-secondary")
+        self._btn_add_bgm_library = Button("Thêm Nhạc Nền", size="small", variant="primary", icon="plus")
+        self._btn_preview_bgm_library = Button("Nghe Nhạc Đã Chọn", size="small", variant="outline", icon="play")
+        self._btn_delete_bgm_library = Button("Xóa Đã Chọn", size="small", variant="danger", icon="trash")
+        bgm_library_panel = Panel(
+            title="Tất Cả Nhạc Nền Đã Thêm",
+            actions=[self._btn_add_bgm_library, self._btn_preview_bgm_library, self._btn_delete_bgm_library],
+            padding=2,
+        )
+        bgm_library_panel.add(self._bgm_library_status)
+        self._bgm_library_table = DataTable(
+            columns=[
+                Column("checked", "", width=44, sortable=False, align="center"),
+                Column("name", "Tên bài nhạc", width=360),
+                Column("size", "Dung lượng", width=110, align="right"),
+            ],
+            rows=[], page_size=None, selection="single", searchable=True,
+            exportable=False, empty_title="Chưa thêm nhạc nền",
+            empty_description="Bấm 'Thêm Nhạc Nền' để đưa nhạc vào ứng dụng.", row_height=34,
+        )
+        self._bgm_library_table.setMinimumHeight(150)
+        self._enable_checkbox_selection(self._bgm_library_table)
+        bgm_library_panel.add(self._bgm_library_table)
+        folders_panel.add(bgm_library_panel)
 
         bgm_mix_row = Stack(direction="horizontal", spacing=3, align="center")
         self._chk_bgm = Checkbox("Bật Nhạc Nền", checked=self.settings.media.bgm_enabled)
@@ -714,6 +849,36 @@ class ThreadsStudioWindow(FluentWindow):
 
         btn_save_preset.clicked.connect(self._save_current_as_preset)
         self._btn_delete_preset.clicked.connect(self._delete_selected_preset)
+        self._picker_bg_file.files_selected.connect(
+            lambda paths: self._import_media_into_library(paths, "video nền")
+        )
+        self._picker_bgm_file.files_selected.connect(
+            lambda paths: self._import_media_into_library(paths, "nhạc nền")
+        )
+        self._picker_sub_file.files_selected.connect(
+            lambda paths: self._import_media_into_library(paths, "video phụ")
+        )
+        self._btn_preview_bg_library.clicked.connect(self._preview_selected_background_video)
+        self._btn_add_bg_library.clicked.connect(self._picker_bg_file.browse)
+        self._bg_library_table.row_activated.connect(self._preview_background_video_row)
+        self._btn_delete_bg_library.clicked.connect(
+            lambda: self._delete_selected_media(self._bg_library_table, "video nền")
+        )
+        self._btn_add_sub_library.clicked.connect(self._picker_sub_file.browse)
+        self._btn_preview_sub_library.clicked.connect(
+            lambda: self._preview_selected_library_video(self._sub_library_table, "video phụ")
+        )
+        self._sub_library_table.row_activated.connect(self._preview_background_video_row)
+        self._btn_delete_sub_library.clicked.connect(
+            lambda: self._delete_selected_media(self._sub_library_table, "video phụ")
+        )
+        self._btn_add_bgm_library.clicked.connect(self._picker_bgm_file.browse)
+        self._btn_preview_bgm_library.clicked.connect(self._preview_selected_background_music)
+        self._bgm_library_table.row_activated.connect(self._preview_background_music_row)
+        self._btn_delete_bgm_library.clicked.connect(
+            lambda: self._delete_selected_media(self._bgm_library_table, "nhạc nền")
+        )
+        self._refresh_media_library_status()
         scroll.setWidget(container)
         return scroll
 
@@ -1017,9 +1182,9 @@ class ThreadsStudioWindow(FluentWindow):
         if chosen_voices:
             self.settings.selected_voices = chosen_voices
 
-        self.settings.media.bg_video_dir = self._picker_bg.path()
-        self.settings.media.sub_video_dir = self._picker_sub.path()
-        self.settings.media.bgm_dir = self._picker_bgm.path()
+        self.settings.media.bg_video_file = ""
+        self.settings.media.sub_video_dir = str(self._managed_media_library("video phụ"))
+        self.settings.media.bgm_file = ""
         self.settings.media.sfx_dir = self._picker_sfx.path()
         self.settings.media.bgm_enabled = self._chk_bgm.isChecked()
         self.settings.media.bgm_volume_pct = int(self._spin_bgm.value())
@@ -1048,6 +1213,220 @@ class ThreadsStudioWindow(FluentWindow):
         self._encoder_badge.set_variant("success" if has_gpu else "info")
         Toast.show("Đã lưu toàn bộ cấu hình Threads Studio Pro.", parent=self, variant="success")
 
+    def _managed_media_library(self, label: str) -> Path:
+        sample_media = project_root() / "assets" / "sample_media"
+        folder = {
+            "video nền": "bg_grid",
+            "video phụ": "sub_videos",
+            "nhạc nền": "bgm",
+        }.get(label, "bgm")
+        return sample_media / folder
+
+    def _refresh_media_library_status(self) -> None:
+        configured_video_dir = Path(self.settings.media.bg_video_dir) if self.settings.media.bg_video_dir else None
+        configured_sub_dir = Path(self.settings.media.sub_video_dir) if self.settings.media.sub_video_dir else None
+        configured_music_dir = Path(self.settings.media.bgm_dir) if self.settings.media.bgm_dir else None
+        video_dir = (
+            configured_video_dir
+            if configured_video_dir and configured_video_dir.is_dir()
+            else self._managed_media_library("video nền")
+        )
+        music_dir = (
+            configured_music_dir
+            if configured_music_dir and configured_music_dir.is_dir()
+            else self._managed_media_library("nhạc nền")
+        )
+        sub_dir = (
+            configured_sub_dir
+            if configured_sub_dir and configured_sub_dir.is_dir()
+            else self._managed_media_library("video phụ")
+        )
+        video_files = sorted(
+            [p for p in video_dir.glob("*") if p.is_file()],
+            key=lambda path: path.name.lower(),
+        ) if video_dir.exists() else []
+        sub_files = sorted(
+            [p for p in sub_dir.glob("*") if p.is_file()], key=lambda path: path.name.lower()
+        ) if sub_dir.exists() else []
+        music_files = sorted(
+            [p for p in music_dir.glob("*") if p.is_file()], key=lambda path: path.name.lower()
+        ) if music_dir.exists() else []
+        video_count = len(video_files)
+        music_count = len(music_files)
+        self._bg_library_status.setText(f"Đã thêm {video_count} video · Ứng dụng tự chọn ngẫu nhiên khi xuất")
+        self._sub_library_status.setText(f"Đã thêm {len(sub_files)} video phụ · Tự cắt ghép ngẫu nhiên khi bật")
+        self._bgm_library_status.setText(f"Đã thêm {music_count} bài nhạc · Ứng dụng tự chọn ngẫu nhiên khi xuất")
+        self._bg_library_table.set_rows(self._media_library_rows(video_files))
+        self._sub_library_table.set_rows(self._media_library_rows(sub_files))
+        self._bgm_library_table.set_rows(self._media_library_rows(music_files))
+
+    def _media_library_rows(self, paths: list[Path]) -> list[dict]:
+        return [
+            {
+                "checked": "☐",
+                "name": path.name,
+                "size": self._format_file_size(path.stat().st_size),
+                "path": str(path),
+            }
+            for path in paths
+        ]
+
+    def _enable_checkbox_selection(self, table: DataTable) -> None:
+        table.view.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        table.selection_changed.connect(lambda rows, current=table: self._sync_checkmarks(current, rows))
+
+    @staticmethod
+    def _sync_checkmarks(table: DataTable, selected_rows: list[dict]) -> None:
+        selected_paths = {str(row.get("path", "")) for row in selected_rows}
+        rows = table.rows()
+        for row in rows:
+            row["checked"] = "☑" if str(row.get("path", "")) in selected_paths else "☐"
+        if rows:
+            table.model.dataChanged.emit(
+                table.model.index(0, 0),
+                table.model.index(table.model.rowCount() - 1, 0),
+            )
+
+    @staticmethod
+    def _format_file_size(size_bytes: int) -> str:
+        size = float(size_bytes)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+        return f"{size:.1f} GB"
+
+    def _preview_selected_background_video(self) -> None:
+        self._preview_selected_library_video(self._bg_library_table, "video nền")
+
+    def _preview_selected_library_video(self, table: DataTable, label: str) -> None:
+        selected = table.selected_rows()
+        if not selected:
+            Toast.show(f"Hãy chọn một {label} trong danh sách.", parent=self, variant="info")
+            return
+        self._preview_background_video_row(selected[0])
+
+    def _preview_background_video_row(self, row: dict) -> None:
+        video_path = Path(str(row.get("path", "")))
+        if not video_path.is_file():
+            Toast.show("Video này không còn tồn tại trong kho.", parent=self, variant="warning")
+            self._refresh_media_library_status()
+            return
+        self._video_player.set_source(str(video_path))
+        self._stage_tabs.setCurrentIndex(1)
+        self._video_player.play()
+
+    def _preview_selected_background_music(self) -> None:
+        selected = self._bgm_library_table.selected_rows()
+        if not selected:
+            Toast.show("Hãy chọn một bài nhạc trong danh sách.", parent=self, variant="info")
+            return
+        self._preview_background_music_row(selected[0])
+
+    def _preview_background_music_row(self, row: dict) -> None:
+        audio_path = Path(str(row.get("path", "")))
+        if not audio_path.is_file():
+            Toast.show("Bài nhạc này không còn tồn tại trong kho.", parent=self, variant="warning")
+            self._refresh_media_library_status()
+            return
+        self._audio_player.setSource(QUrl.fromLocalFile(str(audio_path)))
+        self._audio_player.play()
+        Toast.show(f"Đang phát thử: {audio_path.name}", parent=self, variant="info")
+
+    def _delete_selected_media(self, table: DataTable, label: str) -> None:
+        selected = table.selected_rows()
+        if not selected:
+            Toast.show(f"Hãy tích chọn {label} cần xóa.", parent=self, variant="info")
+            return
+        library = self._managed_media_library(label)
+        media_paths = [Path(str(row.get("path", ""))) for row in selected]
+        try:
+            if any(not path.is_file() or path.resolve().parent != library.resolve() for path in media_paths):
+                Toast.show("Không thể xóa file nằm ngoài kho của ứng dụng.", parent=self, variant="warning")
+                return
+        except OSError:
+            Toast.show("Không tìm thấy file cần xóa.", parent=self, variant="warning")
+            self._refresh_media_library_status()
+            return
+
+        item_word = "file" if len(media_paths) > 1 else media_paths[0].suffix.lstrip(".").upper()
+        dialog = ConfirmDialog(
+            self,
+            title=f"Xóa {label} đã chọn?",
+            message=(
+                f"Bạn sắp xóa vĩnh viễn {len(media_paths)} {item_word} khỏi kho ứng dụng.\n"
+                "Thao tác này không thể hoàn tác."
+            ),
+            confirm_text="Xóa vĩnh viễn",
+            cancel_text="Hủy",
+            danger=True,
+            width=480,
+        )
+        dialog.exec()
+        if not dialog.was_confirmed():
+            return
+        try:
+            self._audio_player.stop()
+            self._video_player.pause()
+            for media_path in media_paths:
+                media_path.unlink()
+            self._refresh_media_library_status()
+            Toast.show(f"Đã xóa {len(media_paths)} file.", parent=self, variant="success")
+        except OSError as exc:
+            Toast.show(f"Không thể xóa file: {exc}", parent=self, variant="danger")
+
+    def _import_media_into_library(self, paths: list[str], label: str) -> None:
+        if not paths:
+            return
+        destination_dir = self._managed_media_library(label)
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            imported = 0
+            skipped = 0
+            for raw_path in paths:
+                source = Path(raw_path)
+                if not source.is_file():
+                    skipped += 1
+                    continue
+                destination = destination_dir / source.name
+                if source.resolve() == destination.resolve():
+                    skipped += 1
+                    continue
+                if destination.exists():
+                    if destination.stat().st_size == source.stat().st_size:
+                        skipped += 1
+                        continue
+                    counter = 2
+                    while destination.exists():
+                        destination = destination_dir / f"{source.stem}-{counter}{source.suffix}"
+                        counter += 1
+                shutil.copy2(source, destination)
+                imported += 1
+            self.settings.media.bg_video_file = ""
+            self.settings.media.bgm_file = ""
+            if label == "video nền":
+                self.settings.media.bg_video_dir = str(destination_dir)
+            elif label == "video phụ":
+                self.settings.media.sub_video_dir = str(destination_dir)
+            else:
+                self.settings.media.bgm_dir = str(destination_dir)
+            self._collect_live_settings()
+            self.settings.save()
+            self._refresh_media_library_status()
+            message = f"Đã thêm {imported} file {label} vào ứng dụng."
+            if skipped:
+                message += f" Bỏ qua {skipped} file đã có."
+            Toast.show(message, parent=self, variant="success" if imported else "info")
+        except OSError as exc:
+            Toast.show(f"Không thể Import {label}: {exc}", parent=self, variant="danger")
+        finally:
+            if label == "video nền":
+                self._picker_bg_file.set_paths([])
+            elif label == "video phụ":
+                self._picker_sub_file.set_paths([])
+            else:
+                self._picker_bgm_file.set_paths([])
+
     def _load_demo_script(self) -> None:
         self._input_mode_seg.set_value("manual")
         self._batch_input_area.set_text(sample_video1_script())
@@ -1065,6 +1444,7 @@ class ThreadsStudioWindow(FluentWindow):
 
     def _on_enqueue_clicked(self) -> None:
         self._collect_live_settings()
+        self.settings.save()
         raw = self._batch_input_area.text().strip()
         if not raw:
             Toast.show("Hãy dán ít nhất 1 link Threads hoặc bấm 'Nạp Bài Mẫu Video 1'.", parent=self, variant="warning")
@@ -1473,9 +1853,13 @@ class ThreadsStudioWindow(FluentWindow):
             self._voice_pool_multiselect.set_values(valid_v)
 
         self.settings.media = copy.deepcopy(p.media)
-        self._picker_bg.set_paths([p.media.bg_video_dir])
-        self._picker_sub.set_paths([p.media.sub_video_dir])
-        self._picker_bgm.set_paths([p.media.bgm_dir])
+        managed_bg = self._managed_media_library("video nền")
+        managed_bgm = self._managed_media_library("nhạc nền")
+        if managed_bg.exists() and any(managed_bg.iterdir()):
+            self.settings.media.bg_video_dir = str(managed_bg)
+        if managed_bgm.exists() and any(managed_bgm.iterdir()):
+            self.settings.media.bgm_dir = str(managed_bgm)
+        self.settings.media.sub_video_dir = str(self._managed_media_library("video phụ"))
         self._picker_sfx.set_paths([p.media.sfx_dir])
         self._chk_bgm.setChecked(p.media.bgm_enabled)
         self._spin_bgm.set_value(p.media.bgm_volume_pct)

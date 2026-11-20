@@ -81,8 +81,10 @@ class MediaConfig:
     """Folder paths and audio mixing levels."""
 
     bg_video_dir: str = ""
+    bg_video_file: str = ""
     sub_video_dir: str = ""
     bgm_dir: str = ""
+    bgm_file: str = ""
     sfx_dir: str = ""
     bgm_enabled: bool = True
     bgm_volume_pct: int = 20
