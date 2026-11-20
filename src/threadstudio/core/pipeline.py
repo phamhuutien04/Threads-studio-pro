@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
+import shutil
 import threading
 
 from fluent_blue.compatibility.qt import QObject, QtCore
@@ -105,6 +106,19 @@ class BatchPipelineManager(QObject):
 
     def review_count(self) -> int:
         return sum(1 for j in self.jobs.values() if j.stage == JobStage.AWAITING_REVIEW.value)
+
+    def forget_completed_job(self, job_id: str) -> None:
+        """Remove a finished job from the in-memory queue after the UI opens its MP4."""
+        job = self.jobs.get(job_id)
+        if not job or job.stage != JobStage.COMPLETED.value:
+            return
+        with self._lock:
+            self.jobs.pop(job_id, None)
+            if job_id in self.job_order:
+                self.job_order.remove(job_id)
+            self._cancelled.discard(job_id)
+        self.job_changed.emit(job_id)
+        self.counts_changed.emit()
 
     # ---- Worker Phases ----
 
@@ -251,7 +265,29 @@ class BatchPipelineManager(QObject):
                     job,
                     out_dir,
                     prefer_nvenc=self.settings.prefer_nvenc,
+                    cancel_requested=lambda: job_id in self._cancelled,
                 )
+
+            if job_id in self._cancelled:
+                return
+
+            # The per-job folder is only a temporary workspace. Move the final
+            # video to the selected output folder, then remove every artifact.
+            output_root = self.settings.resolved_output_root()
+            destination = output_root / final_mp4.name
+            if destination.exists() and destination.resolve() != final_mp4.resolve():
+                destination = output_root / f"{final_mp4.stem}-{job.job_id}{final_mp4.suffix}"
+            if destination.resolve() != final_mp4.resolve():
+                shutil.move(str(final_mp4), str(destination))
+            workspace = Path(job.output_dir)
+            if workspace.exists() and workspace.resolve() != output_root.resolve():
+                try:
+                    shutil.rmtree(workspace)
+                except OSError as cleanup_exc:
+                    logger.warning("[Job #%s] Không thể dọn hết dữ liệu tạm: %s", job_id, cleanup_exc)
+            final_mp4 = destination
+            job.output_dir = ""
+            job.output_mp4 = str(final_mp4)
 
             job.stage = JobStage.COMPLETED.value
             job.progress_pct = 100.0
@@ -262,6 +298,8 @@ class BatchPipelineManager(QObject):
             self.job_finished.emit(job_id, str(final_mp4))
 
         except Exception as exc:
+            if job_id in self._cancelled:
+                return
             logger.error("[Job #%s] Lỗi khâu xuất video: %s", job_id, exc)
             job.stage = JobStage.FAILED.value
             job.error_message = str(exc)

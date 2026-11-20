@@ -1133,6 +1133,9 @@ class ThreadsStudioWindow(FluentWindow):
         if Path(mp4_path).exists():
             self._video_player.set_source(mp4_path)
             self._stage_tabs.setCurrentIndex(1)
+        self.pipeline.forget_completed_job(job_id)
+        if self.pipeline.active_count() == 0 and self.pipeline.review_count() == 0:
+            self._log_viewer.clear()
 
     def _update_badges_and_progress(self) -> None:
         active = self.pipeline.active_count()
@@ -1215,8 +1218,19 @@ class ThreadsStudioWindow(FluentWindow):
             Toast.show("Không có bài nào đang ở trạng thái Chờ duyệt.", parent=self, variant="info")
 
     def _on_stop_all_clicked(self) -> None:
+        stoppable = [
+            job for job in self.pipeline.jobs.values()
+            if job.stage not in (
+                JobStage.COMPLETED.value,
+                JobStage.FAILED.value,
+                JobStage.CANCELLED.value,
+            )
+        ]
+        if not stoppable:
+            Toast.show("Tác vụ đã hoàn tất, hiện không còn tiến trình nào để dừng.", parent=self, variant="info")
+            return
         self.pipeline.cancel_all_active()
-        Toast.show("Đã dừng toàn bộ tác vụ đang chạy.", parent=self, variant="warning")
+        Toast.show(f"Đã dừng {len(stoppable)} tác vụ đang chạy.", parent=self, variant="warning")
 
     # ------------------------------------------------------------------
     # Inspector Editing Logic

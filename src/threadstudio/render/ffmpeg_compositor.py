@@ -7,6 +7,9 @@ import math
 from pathlib import Path
 import random
 import subprocess
+import tempfile
+import time
+from collections.abc import Callable
 import wave
 
 import numpy as np
@@ -63,6 +66,7 @@ def compose_final_video(
     out_dir: Path,
     *,
     prefer_nvenc: bool = True,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> Path:
     """Assemble narration, BGM, SFX, looped 3D grid background, random B-roll, and timed cards."""
     segments = job.enabled_segments
@@ -83,6 +87,7 @@ def compose_final_video(
         media=job.media,
         total_dur=total_dur,
         out_wav=master_audio_wav,
+        cancel_requested=cancel_requested,
     )
 
     # 2. Pick background video
@@ -105,6 +110,7 @@ def compose_final_video(
                 out_dir / "video-phu" / "sub_reel.mp4",
                 target_dur=total_dur,
                 layout=job.layout,
+                cancel_requested=cancel_requested,
             )
 
     # Save diagnostic JSON artifacts matching original Threads Studio's output layout
@@ -141,6 +147,7 @@ def compose_final_video(
         total_dur=total_dur,
         final_mp4=final_mp4,
         prefer_nvenc=prefer_nvenc,
+        cancel_requested=cancel_requested,
     )
     job.output_mp4 = str(final_mp4)
     return final_mp4
@@ -185,6 +192,7 @@ def _mix_master_audio(
     media: MediaConfig,
     total_dur: float,
     out_wav: Path,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[str, list[str]]:
     """Mix narration (100%) + looped BGM (bgm_volume_pct) + transition SFX (sfx_volume_pct)."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -236,7 +244,7 @@ def _mix_master_audio(
             str(out_wav),
         ]
 
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    res = _run_cancelable(cmd, timeout=90, cancel_requested=cancel_requested)
     if res.returncode != 0:
         raise RuntimeError(f"FFmpeg audio mix failed: {res.stderr[-350:]}")
     return chosen_bgm, chosen_sfx
@@ -248,6 +256,7 @@ def _build_sub_video_reel(
     *,
     target_dur: float,
     layout: LayoutConfig,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[Path, list[str]]:
     """Stitch random muted B-roll clips scaled/cropped to exact sub-video box dimensions."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
@@ -295,7 +304,7 @@ def _build_sub_video_reel(
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
         str(out_mp4),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    res = _run_cancelable(cmd, timeout=180, cancel_requested=cancel_requested)
     if res.returncode != 0:
         raise RuntimeError(f"FFmpeg sub-video stitch failed: {res.stderr[-350:]}")
     return out_mp4, [str(p) for p in picked]
@@ -311,6 +320,7 @@ def _run_ffmpeg_compositor(
     total_dur: float,
     final_mp4: Path,
     prefer_nvenc: bool,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
     inputs: list[str] = [
         "-stream_loop", "-1", "-t", f"{total_dur:.3f}", "-i", str(bg_video),
@@ -405,6 +415,50 @@ def _run_ffmpeg_compositor(
         "-t", f"{total_dur:.3f}",
         str(final_mp4),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    res = _run_cancelable(cmd, timeout=300, cancel_requested=cancel_requested)
     if res.returncode != 0 or not final_mp4.exists():
         raise RuntimeError(f"FFmpeg final render failed: {res.stderr[-450:]}")
+
+
+def _run_cancelable(
+    cmd: list[str],
+    *,
+    timeout: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run FFmpeg while allowing the queue's Stop button to terminate it promptly."""
+    # Files are used instead of PIPEs: FFmpeg can emit enough diagnostics to
+    # fill an unread pipe while this loop polls for cancellation, deadlocking it.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout_file, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file:
+        process = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file, text=True)
+        started = time.monotonic()
+        while process.poll() is None:
+            if cancel_requested and cancel_requested():
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise RuntimeError("Đã dừng theo yêu cầu")
+            if time.monotonic() - started > timeout:
+                process.kill()
+                process.wait()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    timeout,
+                    output=stdout_file.read(),
+                    stderr=stderr_file.read(),
+                )
+            time.sleep(0.1)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        return subprocess.CompletedProcess(
+            cmd,
+            process.returncode,
+            stdout_file.read(),
+            stderr_file.read(),
+        )
